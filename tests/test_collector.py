@@ -162,8 +162,11 @@ def test_clean_trace_is_dropped_and_spans_purged(client, clock):
     data = trace(client, tid(4))
     assert data["state"] == "dropped"
     assert data["decision_reason"] == "clean"
-    assert data["spans"] == []
     assert data["retained_spans"] == 0
+    assert data["identity_retained"] is True
+    # The raw payload is gone; only the audit identity remains.
+    assert len(data["spans"]) == 2
+    assert all(s["body"] is None and s["name"] == "op" for s in data["spans"])
 
 
 def test_error_outside_window_is_too_late(client, clock):
@@ -175,7 +178,8 @@ def test_error_outside_window_is_too_late(client, clock):
     assert "window closed" in body["partialSuccess"]["errorMessage"]
     data = trace(client, tid(5))
     assert data["state"] == "dropped"  # late span cannot change the decision
-    assert data["spans"] == []
+    assert data["retained_spans"] == 0
+    assert [s["span_id"] for s in data["spans"]] == [sid(1)]
 
 
 def test_late_span_after_keep_is_also_rejected(client, clock):

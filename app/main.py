@@ -102,6 +102,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "max_active_traces": settings.max_active_traces,
             "slow_root_ms": settings.slow_root_ms,
             "sweep_interval_seconds": settings.sweep_interval_seconds,
+            "link_lookup_max_depth": settings.link_lookup_max_depth,
+            "link_lookup_max_nodes": settings.link_lookup_max_nodes,
         }
 
     # -- OTLP/HTTP ingestion ------------------------------------------------
@@ -125,18 +127,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limit: int = Query(50, ge=1, le=500),
         state: str | None = Query(None, pattern="^(collecting|kept|dropped)$"),
     ) -> dict[str, Any]:
-        return store.list_traces(settings.clock(), limit=limit, state=state)
+        return await asyncio.to_thread(
+            store.list_traces, settings.clock(), limit, state
+        )
 
     @app.get("/api/traces/{trace_id}")
     async def api_trace(trace_id: str) -> Response:
-        trace = store.settle_and_get(trace_id.lower(), settings.clock())
+        trace = await asyncio.to_thread(
+            store.settle_and_get, trace_id.lower(), settings.clock()
+        )
         if trace is None:
             return JSONResponse({"error": "trace not found"}, status_code=404)
         return JSONResponse(trace)
 
+    @app.get("/api/traces/{trace_id}/spans/{span_id}/links")
+    async def api_span_links(trace_id: str, span_id: str) -> Response:
+        """Follow the OTLP links of one retained span, hop by hop."""
+        result = await asyncio.to_thread(
+            store.resolve_links,
+            trace_id.lower(),
+            span_id.lower(),
+            settings.clock(),
+        )
+        if result is None:
+            return JSONResponse(
+                {"error": "span not found in retained data"}, status_code=404
+            )
+        return JSONResponse(result)
+
     @app.get("/api/stats")
     async def api_stats() -> dict[str, Any]:
-        data = store.list_traces(settings.clock(), limit=1)
+        data = await asyncio.to_thread(
+            store.list_traces, settings.clock(), 1, None
+        )
         return {
             "counts": data["counts"],
             "capacity": data["capacity"],

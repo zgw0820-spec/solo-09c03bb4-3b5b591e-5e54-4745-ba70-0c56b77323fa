@@ -21,6 +21,14 @@ class PayloadError(ValueError):
 
 
 @dataclass(frozen=True)
+class Link:
+    """One OTLP span link, reduced to the identity of its target span."""
+
+    trace_id: str
+    span_id: str
+
+
+@dataclass(frozen=True)
 class ParsedSpan:
     trace_id: str
     span_id: str
@@ -34,6 +42,7 @@ class ParsedSpan:
     service: str | None
     scope: str | None
     body: str
+    links: tuple[Link, ...] = ()
 
 
 def _as_text(value: Any) -> str | None:
@@ -44,6 +53,28 @@ def _as_text(value: Any) -> str | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return str(value)
     return None
+
+
+def _parse_links(raw_links: Any) -> tuple[Link, ...]:
+    """Decode ``links`` into usable ``(trace_id, span_id)`` pairs.
+
+    A link without a complete, valid target identity cannot be followed, so it
+    is skipped rather than stored with placeholder ids.
+    """
+    if not isinstance(raw_links, list):
+        return ()
+    links: list[Link] = []
+    for raw in raw_links:
+        if not isinstance(raw, dict):
+            continue
+        trace_id = normalize_id(raw.get("traceId"), 32)
+        span_id = normalize_id(raw.get("spanId"), 16)
+        if trace_id is None or span_id is None:
+            continue
+        if any(link.trace_id == trace_id and link.span_id == span_id for link in links):
+            continue
+        links.append(Link(trace_id=trace_id, span_id=span_id))
+    return tuple(links)
 
 
 def parse_int64(value: Any) -> int | None:
@@ -193,6 +224,7 @@ def parse_otlp_json(payload: Any) -> ParseResult:
             invalid += 1
             continue
         parent_span_id = normalize_id(span.get("parentSpanId"), 16)
+        links = _parse_links(span.get("links"))
         start_ns = parse_int64(span.get("startTimeUnixNano"))
         end_ns = parse_int64(span.get("endTimeUnixNano"))
         duration_ns = None
@@ -212,6 +244,7 @@ def parse_otlp_json(payload: Any) -> ParseResult:
                 service=service,
                 scope=scope,
                 body=json.dumps(span, separators=(",", ":"), sort_keys=True),
+                links=links,
             )
         )
     return ParseResult(tuple(parsed), invalid)

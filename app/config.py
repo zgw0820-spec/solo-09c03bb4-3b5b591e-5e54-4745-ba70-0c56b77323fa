@@ -38,6 +38,8 @@ class Settings:
     max_active_traces: int = 8
     slow_root_ms: float = 500.0
     sweep_interval_seconds: float = 0.05
+    link_lookup_max_depth: int = 10
+    link_lookup_max_nodes: int = 200
     clock: Callable[[], float] = field(default=time.time, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -49,6 +51,10 @@ class Settings:
             raise ValueError("slow_root_ms must be > 0")
         if self.sweep_interval_seconds <= 0:
             raise ValueError("sweep_interval_seconds must be > 0")
+        if self.link_lookup_max_depth < 1:
+            raise ValueError("link_lookup_max_depth must be >= 1")
+        if self.link_lookup_max_nodes < 1:
+            raise ValueError("link_lookup_max_nodes must be >= 1")
 
     @property
     def slow_root_ns(self) -> int:
@@ -62,4 +68,6 @@ class Settings:
             max_active_traces=_env_int("MAX_ACTIVE_TRACES", 8),
             slow_root_ms=_env_float("SLOW_ROOT_MS", 500.0),
             sweep_interval_seconds=_env_int("SWEEP_INTERVAL_MS", 50) / 1000.0,
+            link_lookup_max_depth=_env_int("LINK_LOOKUP_MAX_DEPTH", 10),
+            link_lookup_max_nodes=_env_int("LINK_LOOKUP_MAX_NODES", 200),
         )

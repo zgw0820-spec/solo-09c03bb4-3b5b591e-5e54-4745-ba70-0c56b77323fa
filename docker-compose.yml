@@ -11,6 +11,8 @@ services:
       MAX_ACTIVE_TRACES: "8"
       SLOW_ROOT_MS: "500"
       SWEEP_INTERVAL_MS: "50"
+      LINK_LOOKUP_MAX_DEPTH: "10"
+      LINK_LOOKUP_MAX_NODES: "200"
     volumes:
       # Named volume keeps collection state (and deadlines) across restarts.
       - collector-data:/data

@@ -35,6 +35,7 @@ def _span(
     is_error: bool,
     error_message: str,
     attributes: dict[str, str] | None = None,
+    links: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     end_ns = start_ns + int(duration_ms * 1_000_000)
     span: dict[str, Any] = {
@@ -52,6 +53,11 @@ def _span(
     }
     if parent_span_id:
         span["parentSpanId"] = parent_span_id
+    if links:
+        span["links"] = [
+            {"traceId": link["trace_id"], "spanId": link["span_id"]}
+            for link in links
+        ]
     return span
 
 
@@ -100,6 +106,7 @@ def build_otlp_payload(body: dict[str, Any]) -> dict[str, Any]:
     )
     root_error = bool(body.get("root_error", False))
     downstream_error = bool(body.get("downstream_error", False))
+    links = _parse_links(body.get("links"))
 
     root_start = _now_ns() - int(root_duration * 1_000_000)
     # The downstream hop starts a little after the entry span and must fit
@@ -123,6 +130,7 @@ def build_otlp_payload(body: dict[str, Any]) -> dict[str, Any]:
                 is_error=root_error,
                 error_message="checkout failed",
                 attributes={"http.method": "POST", "demo.part": "entry"},
+                links=links,
             )
         )
     if part in {"both", "downstream"}:
@@ -161,6 +169,24 @@ def build_otlp_payload(body: dict[str, Any]) -> dict[str, Any]:
     if downstream_spans:
         resource_spans.append(_resource_spans(DOWNSTREAM_SERVICE, downstream_spans))
     return {"resourceSpans": resource_spans}
+
+
+def _parse_links(value: Any) -> list[dict[str, str]] | None:
+    """Validate UI-supplied link targets (``trace_id``/``span_id`` hex)."""
+    if value is None or value == []:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("links must be a list")
+    links: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("links entries must be objects")
+        trace_id = _hex16(item.get("trace_id"), 32, "links[].trace_id")
+        span_id = _hex16(item.get("span_id"), 16, "links[].span_id")
+        if trace_id is None or span_id is None:
+            raise ValueError("links entries need trace_id and span_id")
+        links.append({"trace_id": trace_id, "span_id": span_id})
+    return links
 
 
 def _hex16(value: Any, width: int, field: str) -> str | None:

@@ -41,6 +41,22 @@
   .badge.err { background: #3a1117; color: #ff9aa5; }
   .badge.slow { background: #2b1a3d; color: #c9a2ff; }
   .badge.ok { background: #1b2836; color: #8fb6d9; }
+  .badge.link { background: #1a2b3d; color: #8fc7ff; cursor: pointer; }
+  .badge.pending { background: #3b2f10; color: #ffd479; }
+  .badge.cycle { background: #3a1d3d; color: #eaa7ff; }
+  .badge.gone { background: #331318; color: #ff8f9b; }
+  .lookup { margin-top: 12px; border-top: 1px solid #232c38; padding-top: 10px; }
+  .lookup h3 { margin: 0 0 8px; font-size: 13px; color: #9fd0ff; }
+  .lookup .hop { background: #0b0f14; border-left: 3px solid #2b3644; padding: 7px 9px; margin: 6px 0; border-radius: 0 5px 5px 0; font-size: 12px; }
+  .lookup .hop.cycle { border-left-color: #c04fdd; }
+  .lookup .hop.pending { border-left-color: #d8a72a; }
+  .lookup .hop.gone { border-left-color: #b5323f; }
+  .lookup .hop.ok { border-left-color: #2f9f58; }
+  .lookup .hop .ids { color: #8d9bad; word-break: break-all; }
+  .lookup .summary { margin-bottom: 6px; }
+  .link-list { margin-top: 6px; }
+  .link-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 7px; border-radius: 999px; background: #1a2b3d; color: #8fc7ff; cursor: pointer; font-size: 11px; }
+  .link-chip:hover { background: #24405c; }
   .mono { font-family: inherit; word-break: break-all; }
   #log { max-height: 190px; overflow: auto; font-size: 12px; background: #0b0f14; border-radius: 5px; padding: 8px; margin-top: 12px; white-space: pre-wrap; }
   .waterfall { margin-top: 10px; }
@@ -56,6 +72,7 @@
   .kv span:nth-child(odd) { color: #8d9bad; }
   .empty { color: #66768a; padding: 8px 0; }
   @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  #lookup-main { grid-template-columns: 1fr; }
 </style>
 </head>
 <body>
@@ -87,6 +104,8 @@
         <button class="secondary" id="send-root">① 先报入口</button>
         <button class="secondary" id="send-downstream">② 稍后补报下游</button>
       </div>
+      <label>OTLP links（可选；可写多组，用空格分隔 trace_id/span_id）</label>
+      <input type="text" id="links" placeholder="32 位 trace_id 空格 16 位 span_id">
       <div id="log"></div>
     </section>
 
@@ -109,6 +128,14 @@
   <section>
     <h2>链路详情 <span class="muted" id="detail-id"></span></h2>
     <div id="detail" class="empty">在左侧选择一条链路，或在地址栏加 ?trace=&lt;trace_id&gt; 直接查看。</div>
+  </section>
+</main>
+
+<main id="lookup-main" hidden>
+  <section>
+    <h2>上游 span 回查 <span class="muted" id="lookup-id"></span></h2>
+    <div id="lookup-summary" class="lookup"></div>
+    <div id="lookup-body" class="lookup"><div class="empty">在链路详情里点一个 span 的 links 徽标发起回查。</div></div>
   </section>
 </main>
 
@@ -202,13 +229,108 @@ function renderDetail(t) {
       <span>首次接纳</span><span>${fmtTime(t.first_seen_at)}</span>
       <span>截止时间</span><span>${fmtTime(t.deadline_at)}${t.state === "collecting" ? "（剩 " + t.remaining_seconds.toFixed(1) + "s）" : ""}</span>
       <span>根 span 耗时</span><span>${fmtMs(t.root_duration_ns)}（阈值 ${t.slow_root_ms}ms）</span>
-      <span>留存 span</span><span>${t.retained_spans} / 已接收 ${t.span_count}</span>
+      <span>留存 span</span><span>${t.retained_spans} 条原文 / 已接收 ${t.span_count}</span>
+      <span>留证 span</span><span>${t.evidence_spans ?? t.spans.length} 条身份（丢弃后仍可回查）</span>
       <span>入口服务</span><span>${esc(t.service || "—")}</span>
+      ${t.settle_failure ? `<span>留证失败</span><span><span class="badge err">判定暂缓</span> ${esc(t.settle_failure)}（原文保留，稍后重试）</span>` : ""}
     </div>
     <div class="waterfall">${wf}</div>
-    <details><summary>原始 span JSON（${spans.length}）</summary>
-      <pre>${esc(JSON.stringify(spans.map((s) => ({ span_id: s.span_id, parent_span_id: s.parent_span_id, name: s.name, service: s.service, status: s.is_error ? "ERROR" : "OK", duration_ms: s.duration_ms, body: JSON.parse(s.body) })), null, 2))}</pre>
+    ${renderSpanLinks(t)}
+    <details><summary>原始 span JSON（${spans.filter((s) => s.body).length}）</summary>
+      <pre>${esc(JSON.stringify(spans.map((s) => ({ span_id: s.span_id, parent_span_id: s.parent_span_id, name: s.name, service: s.service, status: s.is_error ? "ERROR" : "OK", duration_ms: s.duration_ms, links: s.links, body: s.body ? JSON.parse(s.body) : null })), null, 2))}</pre>
     </details>`;
+  bindLookupTargets($("detail"));
+}
+
+function renderSpanLinks(t) {
+  const withLinks = (t.spans || []).filter((s) => (s.links || []).length);
+  const lost = (t.spans || []).filter((s) => !s.body && !(s.links || []).length);
+  const rows = withLinks.map((s) => {
+    const chips = s.links.map((l) =>
+      `<span class="link-chip" data-trace="${esc(l.trace_id)}" data-span="${esc(l.span_id)}" title="回查 ${esc(l.trace_id)} / ${esc(l.span_id)}">→ ${esc(l.span_id.slice(0, 8))}… @ ${esc(l.trace_id.slice(0, 8))}…</span>`
+    ).join("");
+    const label = s.name + (s.body ? "" : "（原文已丢，仅留证）");
+    return `<div class="link-list"><span class="badge link" data-trace="${esc(t.trace_id)}" data-span="${esc(s.span_id)}">从 ${esc(label)} 回查</span> ${chips}</div>`;
+  }).join("");
+  const note = lost.length
+    ? `<div class="muted" style="margin-top:6px">${lost.length} 条 span 的原文已丢弃；它们的身份与 links 仍保留，可直接回查。</div>`
+    : "";
+  return `<div class="lookup"><h3>按 OTLP links 回查上游 span</h3>` +
+    (rows || '<div class="empty">该链留存的 span 没有 links；可用上方的回查按钮逐个查看。</div>') +
+    note + `</div>`;
+}
+
+async function lookupLinks(traceId, spanId) {
+  const panel = $("lookup-body");
+  $("lookup-main").hidden = false;
+  $("lookup-id").textContent = `${traceId} / ${spanId}`;
+  panel.innerHTML = '<div class="empty">回查中…</div>';
+  $("lookup-summary").innerHTML = "";
+  const res = await fetch(`/api/traces/${encodeURIComponent(traceId)}/spans/${encodeURIComponent(spanId)}/links`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    panel.innerHTML = `<div class="empty">无法回查：${esc(err.error || res.status)}</div>`;
+    return;
+  }
+  renderLookup(await res.json());
+  $("lookup-main").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+const LOOKUP_LABEL = {
+  raw_available: ["ok", "目标 span 原文可查"],
+  admitted_raw_discarded: ["gone", "已接纳，原文已丢弃"],
+  not_admitted: ["pending", "未接纳"],
+  pending: ["pending", "待确认"],
+  unverifiable: ["gone", "升级前已丢弃，无法核实"],
+  cycle: ["cycle", "环"],
+};
+
+function lookupBadge(status) {
+  const [cls, label] = LOOKUP_LABEL[status] || ["ok", status];
+  return `<span class="badge ${cls}">${esc(label)}</span>`;
+}
+
+function renderLookup(r) {
+  const counts = {};
+  for (const h of r.hops) counts[h.target.status] = (counts[h.target.status] || 0) + 1;
+  const pending = r.pending.length;
+  const summary = [
+    `${lookupBadge(r.source.status)} 起点 ${esc(r.source.span_id.slice(0, 8))}…`,
+    `${r.hops.length} 跳`,
+    r.cycles.length ? `<span class="badge cycle">${r.cycles.length} 处环</span>` : "",
+    pending ? `<span class="badge pending">${pending} 个待确认</span>` : "",
+    r.truncated ? '<span class="badge pending">已截断（深度/节点上限）</span>' : "",
+  ].filter(Boolean).join(" · ");
+  $("lookup-summary").innerHTML = `<div class="summary">${summary}</div>`;
+
+  const rows = r.hops.map((h) => {
+    const t = h.target;
+    const tr = t.trace ? `${esc(t.trace.state)}${t.trace.decision_reason ? " / " + esc(t.trace.decision_reason) : ""}` : "尚未出现";
+    let cls = h.cycle ? "cycle" : (t.status === "pending" ? "pending" : (t.status === "raw_available" ? "ok" : "gone"));
+    let extra = "";
+    if (h.cycle) {
+      extra = `<div class="ids">↩ 回到 ${esc(h.cycle_to.span_id)} @ ${esc(h.cycle_to.trace_id)}（已展开过，停止继续）</div>`;
+    } else if (t.status === "pending") {
+      extra = `<div class="ids">${t.trace ? "所属链仍在收集，截止 " + fmtTime(t.trace.deadline_at) : "目标链尚未出现"}，稍后重新回查</div>`;
+    } else if (t.span) {
+      extra = `<div class="ids">${esc(t.span.name)} · ${esc(t.span.service || "—")}${t.span.links.length ? " · 继续 " + t.span.links.length + " 条 link" : ""}</div>`;
+    }
+    return `<div class="hop ${cls}">
+      <div><b>第 ${h.depth} 跳</b> ${lookupBadge(t.status)} ${h.cycle ? '<span class="badge cycle">回到已走过的 span</span>' : ""}
+        <span class="ids">${esc(h.from.span_id.slice(0, 8))}… → ${esc(t.span_id.slice(0, 8))}… @ ${esc(t.trace_id)}</span></div>
+      <div class="ids">目标链：${tr}</div>${extra}
+    </div>`;
+  }).join("");
+  $("lookup-body").innerHTML = rows || '<div class="empty">起点 span 没有 links。</div>';
+}
+
+function bindLookupTargets(root) {
+  root.querySelectorAll("[data-trace][data-span]").forEach((el) => {
+    el.onclick = (ev) => {
+      ev.stopPropagation();
+      lookupLinks(el.dataset.trace, el.dataset.span);
+    };
+  });
 }
 
 function renderWaterfall(spans) {
@@ -239,6 +361,17 @@ async function simulate(part) {
     return null;
   }
   const sameTrace = part === "downstream" ? state.staged.traceId : typed;
+  let links = [];
+  try {
+    links = $("links").value.trim().split(/\s+/).filter(Boolean).map((pair) => {
+      const parts = pair.split(/[/:,]+/).filter(Boolean);
+      if (parts.length !== 2) throw new Error("links 格式应为 trace_id/span_id，可写多组并用空格分隔");
+      return { trace_id: parts[0], span_id: parts[1] };
+    });
+  } catch (err) {
+    log(`❌ ${err.message}`);
+    return null;
+  }
   const body = {
     part,
     // Reuse the entry span id only when continuing a staged trace; every new
@@ -249,6 +382,7 @@ async function simulate(part) {
     downstream_duration_ms: Number($("downstream_duration_ms").value),
     root_error: $("root_error").checked,
     downstream_error: $("downstream_error").checked,
+    links,
   };
   const res = await fetch("/api/simulate", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -274,8 +408,7 @@ $("new-trace").onclick = () => {
   state.staged = null;
   $("trace_id").value = "";
   log("🆕 已清空，下一次上报将创建新链路");
-};
-$("send-both").onclick = () => simulate("both");
+};$("send-both").onclick = () => simulate("both");
 $("send-root").onclick = () => simulate("root");
 $("send-downstream").onclick = () => simulate("downstream");
 document.querySelectorAll("[data-filter]").forEach((b) => {
@@ -288,8 +421,9 @@ document.querySelectorAll("[data-filter]").forEach((b) => {
   if (preset) state.selected = preset;
   await refresh();
   if (state.selected) await selectTrace(state.selected, true);
-  setInterval(refresh, 1000);
-})();
+  const presetSpan = new URL(location).searchParams.get("span");
+  if (preset && presetSpan) await lookupLinks(preset, presetSpan);
+  setInterval(refresh, 1000);})();
 </script>
 </body>
 </html>
